@@ -11,45 +11,55 @@ jobs:
     
     steps:
       - name: 检出仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
       
       - name: 获取 cfnew 最新发布
         id: get_latest
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # 获取最新 release 信息
+          # 带 token 调用 GitHub API（匿名调用每小时只有 60 次且共享 runner IP，容易被限流返回空结果）
           echo "正在获取最新发布信息..."
-          LATEST_RELEASE=$(curl -s https://api.github.com/repos/byJoey/cfnew/releases/latest)
-          
-          # 使用 sed 提取版本号（兼容性更好）
-          VERSION=$(echo "$LATEST_RELEASE" | sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p')
-          
+          LATEST_RELEASE=""
+          for i in 1 2 3; do
+            if LATEST_RELEASE=$(curl -fsSL --retry 3 --retry-delay 5 \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                https://api.github.com/repos/byJoey/cfnew/releases/latest); then
+              break
+            fi
+            echo "第 $i 次获取失败，10 秒后重试..."
+            sleep 10
+          done
+
+          VERSION=$(echo "$LATEST_RELEASE" | jq -r '.tag_name // empty')
+          if [ -z "$VERSION" ]; then
+            echo "错误：未能获取最新版本号，API 返回："
+            echo "$LATEST_RELEASE" | head -c 500
+            exit 1
+          fi
+
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "最新版本: $VERSION"
-          
-          # 获取所有 assets 文件
-          ASSETS_URL=$(echo "$LATEST_RELEASE" | sed -n 's/.*"assets_url": "\([^"]*\)".*/\1/p')
-          echo "正在获取文件列表..."
-          ASSETS=$(curl -s "$ASSETS_URL")
-          
-          # 查找 Pages.zip 文件
-          # 使用更可靠的方法查找包含 Pages.zip 的下载 URL
-          DOWNLOAD_URL=$(echo "$ASSETS" | grep -i "Pages\.zip" | grep -o '"browser_download_url": "[^"]*"' | sed 's/"browser_download_url": "\([^"]*\)"/\1/' | head -1)
+
+          # 直接从 release 信息里取 Pages.zip 的下载地址，无需再请求 assets_url
+          DOWNLOAD_URL=$(echo "$LATEST_RELEASE" | jq -r '[.assets[] | select(.name | test("^Pages\\.zip$"; "i")) | .browser_download_url][0] // empty')
           FILE_NAME="Pages.zip"
-          
+
           if [ -z "$DOWNLOAD_URL" ]; then
             echo "错误：未找到 Pages.zip 文件"
             echo "可用的文件列表："
-            echo "$ASSETS" | grep -o '"name": "[^"]*"' | sed 's/"name": "\([^"]*\)"/  - \1/'
+            echo "$LATEST_RELEASE" | jq -r '.assets[].name' | sed 's/^/  - /'
             exit 1
           fi
-          
+
           echo "download_url=$DOWNLOAD_URL" >> $GITHUB_OUTPUT
           echo "file_name=$FILE_NAME" >> $GITHUB_OUTPUT
           echo "下载 URL: $DOWNLOAD_URL"
           echo "文件名: $FILE_NAME"
-      
+
       - name: 检查当前版本
         id: check_version
         run: |
@@ -102,7 +112,7 @@ jobs:
           fi
           
           echo "正在下载文件: $FILE_NAME"
-          curl -L -o "$FILE_NAME" "$DOWNLOAD_URL"
+          curl -fL --retry 3 -o "$FILE_NAME" "$DOWNLOAD_URL"
           
           if [ ! -f "$FILE_NAME" ]; then
             echo "错误：下载失败"
